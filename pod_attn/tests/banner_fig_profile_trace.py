@@ -3,6 +3,7 @@ import pod_attn
 import argparse
 import fibench
 import time
+from torch.profiler import profile, record_function, ProfilerActivity
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--stage', type=str, default='prefill', help='')
@@ -12,7 +13,6 @@ parser.add_argument('--p_cs', type=int, default=1024, help='prefill chunk size')
 parser.add_argument('--d_bs', type=int, default=1, help='decode batch size')
 parser.add_argument('--d_cl', type=int, default=4096, help='decode context length')
 parser.add_argument('--fused', type=int, default=9, help='fused params')
-parser.add_argument('--repeat', type=int, default=1, help='number of repeats')
 args = parser.parse_args()
 
 p_cl = args.p_cl
@@ -30,7 +30,7 @@ num_heads = model_configs['llama-3-8b-tp2']['num_heads']
 num_kv_heads = model_configs['llama-3-8b-tp2']['num_kv_heads']
 head_size = model_configs['llama-3-8b-tp2']['head_size']
 
-active_steps = args.repeat
+active_steps = 1024
 
 def calc_latency(start, end, steps):
     return round(start.elapsed_time(end) / steps, 3)
@@ -219,28 +219,30 @@ q_d = torch.randn(d_bs, 1, num_heads, head_size, device='cuda', dtype=torch.floa
 k_d = torch.randn(d_bs, d_cl, num_kv_heads, head_size, device='cuda', dtype=torch.float16)
 v_d = torch.randn(d_bs, d_cl, num_kv_heads, head_size, device='cuda', dtype=torch.float16)
 
-torch.cuda.synchronize()
-time_start = time.time()
 
-if args.stage == 'prefill':
-    fa_prefill = do_fa_prefill(q_p, k_p, v_p)
+device = 'cuda'
 
-if args.stage == 'decode':
-    fa_decode = do_fa_decode_lean(q_d, k_d, v_d)
+activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA, ProfilerActivity.XPU]
 
-if args.stage == 'fused':
-    fa_prefill, fa_decode = do_true_fused_attn(q_p, k_p, v_p, q_d, k_d, v_d, fused_params=fused_params)
+with profile(activities=activities) as prof:
+    torch.cuda.synchronize()
+    time_start = time.time()
+    if args.stage == 'prefill':
+        fa_prefill = do_fa_prefill(q_p, k_p, v_p)
+    if args.stage == 'decode':
+        fa_decode = do_fa_decode_lean(q_d, k_d, v_d)
+    if args.stage == 'fused':
+        fa_prefill, fa_decode = do_true_fused_attn(q_p, k_p, v_p, q_d, k_d, v_d, fused_params=fused_params)
+    if args.stage == 'fi_prefill':
+        fi_p_latency = do_fi_prefill_paged(1, p_cs, p_cl, num_heads, num_kv_heads, head_size, 16)
+    if args.stage == 'fi_decode':
+        fi_d_latency = do_fi_decode_paged(d_bs, d_cl, num_heads, num_kv_heads, head_size, 16)
+    if args.stage == 'fi_batch':
+        fi_fused_latency = do_fi_fused_paged(p_cs, p_cl, d_bs, d_cl, num_heads, num_kv_heads, head_size, 16)
+    torch.cuda.synchronize()
+    time_end = time.time()
 
-if args.stage == 'fi_prefill':
-    fi_p_latency = do_fi_prefill_paged(1, p_cs, p_cl, num_heads, num_kv_heads, head_size, 16)
+prof.export_chrome_trace(f'trace_{args.stage}_{args.p_cl}_{args.p_cs}_{args.d_bs}_{args.d_cl}')
 
-if args.stage == 'fi_decode':
-    fi_d_latency = do_fi_decode_paged(d_bs, d_cl, num_heads, num_kv_heads, head_size, 16)
-
-if args.stage == 'fi_batch':
-    fi_fused_latency = do_fi_fused_paged(p_cs, p_cl, d_bs, d_cl, num_heads, num_kv_heads, head_size, 16)
-
-torch.cuda.synchronize()
-time_end = time.time()
 step_time = (time_end - time_start) / active_steps * 1000
-# print(f"Time taken for {args.stage} stage: {step_time:.6f} ms")
+print(f"Time taken for {args.stage} stage: {step_time:.6f} ms")
